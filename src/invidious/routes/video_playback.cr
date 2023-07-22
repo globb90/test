@@ -8,13 +8,17 @@ module Invidious::Routes::VideoPlayback
     mns = query_params["mn"]?.try &.split(",")
     mns ||= [] of String
 
-    if query_params["region"]?
-      region = query_params["region"]
+    # Extract some invidious-specific parameters
+
+    if region = query_params["region"]?
       query_params.delete("region")
     end
 
-    if query_params["host"]? && !query_params["host"].empty?
-      host = query_params["host"]
+    if title = query_params["title"]?
+      query_params.delete("title")
+    end
+
+    if host = query_params["host"]?
       query_params.delete("host")
     else
       host = "r#{fvip}---#{mns.pop}.googlevideo.com"
@@ -25,22 +29,31 @@ module Invidious::Routes::VideoPlayback
       return error_template(400, "Invalid \"host\" parameter.")
     end
 
+    # Range manipulation
+
+    has_range_param = false
+    has_range_header = false
+
+    if range = query_params["range"]?
+      query_params.delete("range")
+      has_range_param = true
+    end
+
+    if range_header = env.request.headers["Range"]?
+      env.request.headers.delete("Range")
+      range ||= range_header.split('=')[1]
+      has_range_header = true if !has_range_param
+    end
+
+    # Skip redirections
+
     host = "https://#{host}"
     url = "/videoplayback?#{query_params}"
 
     headers = HTTP::Headers.new
-    REQUEST_HEADERS_WHITELIST.each do |header|
-      if env.request.headers[header]?
-        headers[header] = env.request.headers[header]
-      end
-    end
+    MediaProxy.copy_request_headers(from: env.request.headers, to: headers)
 
-    # See: https://github.com/iv-org/invidious/issues/3302
-    range_header = env.request.headers["Range"]?
-    if range_header.nil?
-      range_for_head = query_params["range"]? || "0-640"
-      headers["Range"] = "bytes=#{range_for_head}"
-    end
+    headers["Range"] = "bytes=" + (range || "0-")
 
     client = make_client(URI.parse(host), region)
     response = HTTP::Client::Response.new(500)
@@ -78,7 +91,7 @@ module Invidious::Routes::VideoPlayback
     end
 
     # Remove the Range header added previously.
-    headers.delete("Range") if range_header.nil?
+    headers.delete("Range")
 
     if response.status_code >= 400
       env.response.content_type = "text/plain"
@@ -90,34 +103,24 @@ module Invidious::Routes::VideoPlayback
         return error_template(403, "Administrator has disabled this endpoint.")
       end
 
-      begin
-        client.get(url, headers) do |resp|
-          resp.headers.each do |key, value|
-            if !RESPONSE_HEADERS_BLACKLIST.includes?(key.downcase)
-              env.response.headers[key] = value
-            end
-          end
+      # Add back the range header. Important!
+      headers["Range"] = "bytes=" + (range || "0-")
 
-          env.response.headers["Access-Control-Allow-Origin"] = "*"
-
-          if location = resp.headers["Location"]?
-            url = Invidious::HttpServer::Utils.proxy_video_url(location, region: region)
-            return env.redirect url
-          end
-
-          IO.copy(resp.body_io, env.response)
-        end
-      rescue ex
+      MediaProxy.proxy_dash_chunk(env, client, url, region)
+    elsif has_range_param
+      if CONFIG.disabled?("dash")
+        return error_template(403, "Administrator has disabled this endpoint.")
       end
+
+      MediaProxy.proxy_dash_chunk(env, client, url + "&range=#{range}", region)
     else
-      if query_params["title"]? && CONFIG.disabled?("downloads") ||
-         CONFIG.disabled?("dash")
+      if (title && CONFIG.disabled?("downloads")) || (title.nil? && CONFIG.disabled?("local"))
         return error_template(403, "Administrator has disabled this endpoint.")
       end
 
       content_length = nil
       first_chunk = true
-      range_start, range_end = parse_range(env.request.headers["Range"]?)
+      range_start, range_end = parse_range(range)
       chunk_start = range_start
       chunk_end = range_end
 
@@ -144,19 +147,11 @@ module Invidious::Routes::VideoPlayback
         begin
           client.get(url, headers) do |resp|
             if first_chunk
-              if !env.request.headers["Range"]? && resp.status_code == 206
+              if !has_range_header && resp.status_code == 206
                 env.response.status_code = 200
               else
                 env.response.status_code = resp.status_code
               end
-
-              resp.headers.each do |key, value|
-                if !RESPONSE_HEADERS_BLACKLIST.includes?(key.downcase) && key.downcase != "content-range"
-                  env.response.headers[key] = value
-                end
-              end
-
-              env.response.headers["Access-Control-Allow-Origin"] = "*"
 
               if location = resp.headers["Location"]?
                 location = URI.parse(location)
@@ -166,8 +161,12 @@ module Invidious::Routes::VideoPlayback
                 break
               end
 
-              if title = query_params["title"]?
-                # https://blog.fastmail.com/2011/06/24/download-non-english-filenames/
+              MediaProxy.copy_response_headers(from: resp.headers, to: env.response.headers)
+              env.response.headers.delete("Content-Range") # Important!
+              env.response.headers["Access-Control-Allow-Origin"] = "*"
+
+              if title
+                # http://web.archive.org/web/20150701003254/https://blog.fastmail.com/2011/06/24/download-non-english-filenames/
                 filename = URI.encode_www_form(title, space_to_plus: false)
                 header = "attachment; filename=\"#{filename}\"; filename*=UTF-8''#{filename}"
                 env.response.headers["Content-Disposition"] = header
@@ -175,7 +174,7 @@ module Invidious::Routes::VideoPlayback
 
               if !resp.headers.includes_word?("Transfer-Encoding", "chunked")
                 content_length = resp.headers["Content-Range"].split("/")[-1].to_i64
-                if env.request.headers["Range"]?
+                if has_range_header
                   env.response.headers["Content-Range"] = "bytes #{range_start}-#{range_end || (content_length - 1)}/#{content_length}"
                   env.response.content_length = ((range_end.try &.+ 1) || content_length) - range_start
                 else
